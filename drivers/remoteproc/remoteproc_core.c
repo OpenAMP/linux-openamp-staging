@@ -38,6 +38,7 @@
 #include <linux/virtio_ring.h>
 #include <asm/byteorder.h>
 #include <linux/platform_device.h>
+#include <linux/of_platform.h>
 
 #include "remoteproc_internal.h"
 
@@ -1263,6 +1264,31 @@ void rproc_resource_cleanup(struct rproc *rproc)
 }
 EXPORT_SYMBOL(rproc_resource_cleanup);
 
+static const struct of_device_id rproc_child_match_table[] = {
+	{ .compatible = "virtio,mmio", },
+	{ }
+};
+
+static int rproc_platform_populate(struct rproc *rproc)
+{
+	struct device *dev = rproc->dev.parent;
+	int ret;
+
+	ret = of_platform_populate(dev->of_node, rproc_child_match_table, NULL, dev);
+	if (ret < 0) {
+		dev_err(dev, "failed to populate child devices (%d)\n", ret);
+
+		goto depopulate;
+	}
+
+	return 0;
+
+depopulate:
+	of_platform_depopulate(dev);
+
+	return ret;
+}
+
 static int rproc_start(struct rproc *rproc, const struct firmware *fw)
 {
 	struct resource_table *loaded_table;
@@ -1304,6 +1330,11 @@ static int rproc_start(struct rproc *rproc, const struct firmware *fw)
 		goto unprepare_subdevices;
 	}
 
+	/* probe remoteproc device resource suppliers */
+	ret = rproc_platform_populate(rproc);
+	if (ret)
+		goto depopulate;
+
 	/* Start any subdevices for the remote processor */
 	ret = rproc_start_subdevices(rproc);
 	if (ret) {
@@ -1320,6 +1351,8 @@ static int rproc_start(struct rproc *rproc, const struct firmware *fw)
 
 stop_rproc:
 	rproc->ops->stop(rproc);
+depopulate:
+	of_platform_depopulate(rproc->dev.parent);
 unprepare_subdevices:
 	rproc_unprepare_subdevices(rproc);
 reset_table_ptr:
@@ -1348,6 +1381,11 @@ static int __rproc_attach(struct rproc *rproc)
 		goto unprepare_subdevices;
 	}
 
+	/* probe remoteproc device resource suppliers */
+	ret = rproc_platform_populate(rproc);
+	if (ret)
+		goto depopulate;
+
 	/* Start any subdevices for the remote processor */
 	ret = rproc_start_subdevices(rproc);
 	if (ret) {
@@ -1364,6 +1402,8 @@ static int __rproc_attach(struct rproc *rproc)
 
 stop_rproc:
 	rproc->ops->stop(rproc);
+depopulate:
+	of_platform_depopulate(rproc->dev.parent);
 unprepare_subdevices:
 	rproc_unprepare_subdevices(rproc);
 out:
@@ -1722,6 +1762,7 @@ static int rproc_stop(struct rproc *rproc, bool crashed)
 		return ret;
 	}
 
+	of_platform_depopulate(rproc->dev.parent);
 
 	/* power off the remote processor */
 	ret = rproc->ops->stop(rproc);
@@ -1760,6 +1801,8 @@ static int __rproc_detach(struct rproc *rproc)
 		dev_err(dev, "can't reset resource table: %d\n", ret);
 		return ret;
 	}
+
+	of_platform_depopulate(rproc->dev.parent);
 
 	/* Tell the remote processor the core isn't available anymore */
 	ret = rproc->ops->detach(rproc);
@@ -2574,6 +2617,8 @@ int rproc_del(struct rproc *rproc)
 
 	/* Ensure that no readers of rproc_list are still active */
 	synchronize_rcu();
+
+	of_platform_depopulate(rproc->dev.parent);
 
 	device_del(&rproc->dev);
 	rproc_char_device_remove(rproc);

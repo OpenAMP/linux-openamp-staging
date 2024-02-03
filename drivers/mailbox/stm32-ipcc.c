@@ -9,11 +9,13 @@
 #include <linux/clk.h>
 #include <linux/interrupt.h>
 #include <linux/io.h>
+#include <linux/irqdomain.h>
 #include <linux/mailbox_controller.h>
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
 #include <linux/pm_wakeirq.h>
+#include <linux/workqueue.h>
 
 #define IPCC_XCR		0x000
 #define XCR_RXOIE		BIT(0)
@@ -46,11 +48,22 @@ enum {
 	IPCC_IRQ_NUM,
 };
 
+struct stm32_ipcc_ch {
+	struct mbox_chan	*mbox;
+	struct work_struct	rx_work;
+	unsigned long		chan;
+	u32					irq_mask;	/* 1: activated 0: disabled */
+	bool				irq_ctx;
+};
+
 struct stm32_ipcc {
 	struct mbox_controller controller;
 	void __iomem *reg_base;
 	void __iomem *reg_proc;
 	struct clk *clk;
+	struct stm32_ipcc_ch *chnl;
+	struct irq_domain *irqd;
+	struct workqueue_struct *workqueue;
 	spinlock_t lock; /* protect access to IPCC registers */
 	int irqs[IPCC_IRQ_NUM];
 	u32 proc_id;
@@ -60,7 +73,7 @@ struct stm32_ipcc {
 };
 
 static inline void stm32_ipcc_set_bits(spinlock_t *lock, void __iomem *reg,
-				       u32 mask)
+						u32 mask)
 {
 	unsigned long flags;
 
@@ -70,7 +83,7 @@ static inline void stm32_ipcc_set_bits(spinlock_t *lock, void __iomem *reg,
 }
 
 static inline void stm32_ipcc_clr_bits(spinlock_t *lock, void __iomem *reg,
-				       u32 mask)
+						u32 mask)
 {
 	unsigned long flags;
 
@@ -79,10 +92,21 @@ static inline void stm32_ipcc_clr_bits(spinlock_t *lock, void __iomem *reg,
 	spin_unlock_irqrestore(lock, flags);
 }
 
+/*
+ * Message receiver(workqueue)
+ */
+static void stm32_ipcc_rx_work(struct work_struct *work)
+{
+	struct stm32_ipcc_ch *chnl = container_of(work, struct stm32_ipcc_ch, rx_work);
+
+	mbox_chan_received_data(chnl->mbox, NULL);
+};
+
 static irqreturn_t stm32_ipcc_rx_irq(int irq, void *data)
 {
 	struct stm32_ipcc *ipcc = data;
 	struct device *dev = ipcc->controller.dev;
+	struct stm32_ipcc_ch *chnl;
 	u32 status, mr, tosr, chan;
 	irqreturn_t ret = IRQ_NONE;
 	int proc_offset;
@@ -101,10 +125,27 @@ static irqreturn_t stm32_ipcc_rx_irq(int irq, void *data)
 
 		dev_dbg(dev, "%s: chan:%d rx\n", __func__, chan);
 
-		mbox_chan_received_data(&ipcc->controller.chans[chan], NULL);
+		chnl = &ipcc->chnl[chan];
+
+		/*
+		 * Depending on the DT parameter,call the client under interrupt context
+		 * or use workqueue to call the callback in normal context
+		 */
+
+		if (chnl->irq_ctx) {
+			if (!chnl->irq_mask) {
+				local_irq_disable();
+				handle_simple_irq(irq_to_desc(irq_find_mapping(ipcc->irqd,
+									       chnl->chan)));
+				local_irq_enable();
+			}
+		} else {
+			dev_dbg(dev, "%s: WK chan:%d rx\n", __func__, chan);
+			queue_work(ipcc->workqueue, &chnl->rx_work);
+		}
 
 		stm32_ipcc_set_bits(&ipcc->lock, ipcc->reg_proc + IPCC_XSCR,
-				    RX_BIT_CHAN(chan));
+					RX_BIT_CHAN(chan));
 
 		ret = IRQ_HANDLED;
 	}
@@ -133,7 +174,7 @@ static irqreturn_t stm32_ipcc_tx_irq(int irq, void *data)
 
 		/* mask 'tx channel free' interrupt */
 		stm32_ipcc_set_bits(&ipcc->lock, ipcc->reg_proc + IPCC_XMR,
-				    TX_BIT_CHAN(chan));
+					TX_BIT_CHAN(chan));
 
 		mbox_chan_txdone(&ipcc->controller.chans[chan], 0);
 
@@ -143,28 +184,85 @@ static irqreturn_t stm32_ipcc_tx_irq(int irq, void *data)
 	return ret;
 }
 
+static void stm32_ipcc_mask_irq(struct irq_data *d)
+{
+	struct stm32_ipcc_ch *chn = irq_data_get_irq_chip_data(d);
+
+	chn->irq_mask = 1;
+}
+
+static void stm32_ipcc_unmask_irq(struct irq_data *d)
+{
+	struct stm32_ipcc_ch *chn = irq_data_get_irq_chip_data(d);
+
+	chn->irq_mask = 0;
+}
+
+static struct irq_chip stm32_ipcc_chip = {
+	.name		= "irq-rpmsg",
+	.irq_mask	= stm32_ipcc_mask_irq,
+	.irq_unmask	= stm32_ipcc_unmask_irq,
+};
+
+static int stm32_ipcc_map(struct irq_domain *d,
+			  unsigned int virq, irq_hw_number_t hw)
+{
+	struct stm32_ipcc *ipcc = d->host_data;
+	struct mbox_controller *mbox =  &ipcc->controller;
+	struct stm32_ipcc_ch *chnl;
+
+	pr_err("APO: %s: %d", __func__, __LINE__);
+
+	if (hw >= ipcc->n_chans)
+		return -EINVAL;
+
+	chnl = &ipcc->chnl[hw];
+
+	if (chnl->mbox) {
+		dev_err(mbox->dev, "chan:%lu already used\n", chnl->chan);
+		return -EINVAL;
+	}
+
+	chnl->mbox = &mbox->chans[hw];
+	chnl->chan = hw;
+
+	chnl->irq_ctx = true;
+
+	irq_set_status_flags(virq, IRQ_LEVEL);
+	irq_set_chip_and_handler(virq, &stm32_ipcc_chip, handle_level_irq);
+	irq_set_chip_data(virq, chnl);
+
+	/* unmask 'rx channel occupied' interrupt */
+	stm32_ipcc_clr_bits(&ipcc->lock, ipcc->reg_proc + IPCC_XMR,
+			    RX_BIT_CHAN(hw));
+
+	return 0;
+}
+
 static int stm32_ipcc_send_data(struct mbox_chan *link, void *data)
 {
-	unsigned long chan = (unsigned long)link->con_priv;
+	struct stm32_ipcc_ch *chnl = (struct stm32_ipcc_ch *)link->con_priv;
+	unsigned long chan = chnl->chan;
 	struct stm32_ipcc *ipcc = container_of(link->mbox, struct stm32_ipcc,
-					       controller);
+							controller);
 
 	dev_dbg(ipcc->controller.dev, "%s: chan:%lu\n", __func__, chan);
 
 	/* set channel n occupied */
 	stm32_ipcc_set_bits(&ipcc->lock, ipcc->reg_proc + IPCC_XSCR,
-			    TX_BIT_CHAN(chan));
+				TX_BIT_CHAN(chan));
 
 	/* unmask 'tx channel free' interrupt */
 	stm32_ipcc_clr_bits(&ipcc->lock, ipcc->reg_proc + IPCC_XMR,
-			    TX_BIT_CHAN(chan));
+				TX_BIT_CHAN(chan));
 
 	return 0;
 }
 
 static int stm32_ipcc_startup(struct mbox_chan *link)
 {
-	unsigned long chan = (unsigned long)link->con_priv;
+	struct stm32_ipcc_ch *chnl = (struct stm32_ipcc_ch *)link->con_priv;
+	unsigned long chan = chnl->chan;
 	struct stm32_ipcc *ipcc = container_of(link->mbox, struct stm32_ipcc,
 					       controller);
 	int ret;
@@ -184,13 +282,17 @@ static int stm32_ipcc_startup(struct mbox_chan *link)
 
 static void stm32_ipcc_shutdown(struct mbox_chan *link)
 {
-	unsigned long chan = (unsigned long)link->con_priv;
+	struct stm32_ipcc_ch *chnl = (struct stm32_ipcc_ch *)link->con_priv;
+	unsigned long chan = chnl->chan;
 	struct stm32_ipcc *ipcc = container_of(link->mbox, struct stm32_ipcc,
 					       controller);
 
 	/* mask rx/tx interrupt */
 	stm32_ipcc_set_bits(&ipcc->lock, ipcc->reg_proc + IPCC_XMR,
 			    RX_BIT_CHAN(chan) | TX_BIT_CHAN(chan));
+
+	if (!chnl->irq_ctx)
+		flush_work(&chnl->rx_work);
 
 	clk_disable_unprepare(ipcc->clk);
 }
@@ -199,6 +301,31 @@ static const struct mbox_chan_ops stm32_ipcc_ops = {
 	.send_data	= stm32_ipcc_send_data,
 	.startup	= stm32_ipcc_startup,
 	.shutdown	= stm32_ipcc_shutdown,
+};
+
+static struct mbox_chan *stm32_ipcc_xlate(struct mbox_controller *mbox,
+					  const struct of_phandle_args *sp)
+{
+	int ind = sp->args[0];
+	struct stm32_ipcc_ch *chnl;
+
+	pr_err("APO: %s: %d", __func__, __LINE__);
+	if (ind >= mbox->num_chans)
+		return ERR_PTR(-EINVAL);
+
+	chnl = (struct stm32_ipcc_ch *)mbox->chans[ind].con_priv;
+	chnl->mbox = &mbox->chans[ind];
+	chnl->chan = ind;
+
+	if (!chnl->irq_ctx)
+		INIT_WORK(&chnl->rx_work, stm32_ipcc_rx_work);
+
+	return &mbox->chans[ind];
+}
+
+static const struct irq_domain_ops stm32_ipcc_domain_ops = {
+	.map = stm32_ipcc_map,
+	.xlate = irq_domain_xlate_onecell,
 };
 
 static int stm32_ipcc_probe(struct platform_device *pdev)
@@ -293,34 +420,58 @@ static int stm32_ipcc_probe(struct platform_device *pdev)
 	ipcc->controller.dev = dev;
 	ipcc->controller.txdone_irq = true;
 	ipcc->controller.ops = &stm32_ipcc_ops;
+	ipcc->controller.of_xlate = &stm32_ipcc_xlate;
 	ipcc->controller.num_chans = ipcc->n_chans;
 	ipcc->controller.chans = devm_kcalloc(dev, ipcc->controller.num_chans,
-					      sizeof(*ipcc->controller.chans),
-					      GFP_KERNEL);
+						sizeof(*ipcc->controller.chans),
+						GFP_KERNEL);
 	if (!ipcc->controller.chans) {
 		ret = -ENOMEM;
 		goto err_irq_wkp;
 	}
 
+	ipcc->chnl = devm_kcalloc(dev, ipcc->controller.num_chans,
+				  sizeof(*ipcc->chnl), GFP_KERNEL);
+	if (!ipcc->chnl) {
+		ret = -ENOMEM;
+		goto err_irq_wkp;
+	}
+
 	for (i = 0; i < ipcc->controller.num_chans; i++)
-		ipcc->controller.chans[i].con_priv = (void *)i;
+		ipcc->controller.chans[i].con_priv = (void *)&ipcc->chnl[i];
+
+	ipcc->irqd = irq_domain_create_linear(dev->fwnode, ipcc->n_chans,  &stm32_ipcc_domain_ops,
+					      ipcc);
+	if (!ipcc->irqd) {
+		dev_err(dev, "Failed to create IRQ domain\n");
+		goto err_irq_wkp;
+	}
 
 	ret = devm_mbox_controller_register(dev, &ipcc->controller);
 	if (ret)
-		goto err_irq_wkp;
+		goto err_irq_domain;
+
+	ipcc->workqueue = create_workqueue(dev_name(dev));
+	if (!ipcc->workqueue) {
+		dev_err(dev, "cannot create workqueue\n");
+		ret = -ENOMEM;
+		goto err_irq_domain;
+	}
 
 	platform_set_drvdata(pdev, ipcc);
 
 	ip_ver = readl_relaxed(ipcc->reg_base + IPCC_VER);
 
 	dev_info(dev, "ipcc rev:%ld.%ld enabled, %d chans, proc %d\n",
-		 FIELD_GET(VER_MAJREV_MASK, ip_ver),
-		 FIELD_GET(VER_MINREV_MASK, ip_ver),
-		 ipcc->controller.num_chans, ipcc->proc_id);
+			FIELD_GET(VER_MAJREV_MASK, ip_ver),
+			FIELD_GET(VER_MINREV_MASK, ip_ver),
+			ipcc->controller.num_chans, ipcc->proc_id);
 
 	clk_disable_unprepare(ipcc->clk);
 	return 0;
 
+err_irq_domain:
+	irq_domain_remove(ipcc->irqd);
 err_irq_wkp:
 	if (of_property_read_bool(np, "wakeup-source"))
 		dev_pm_clear_wake_irq(dev);
@@ -334,9 +485,14 @@ err_clk:
 static int stm32_ipcc_remove(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
+	struct stm32_ipcc *ipcc = dev_get_drvdata(dev);
+
+	irq_domain_remove(ipcc->irqd);
 
 	if (of_property_read_bool(dev->of_node, "wakeup-source"))
 		dev_pm_clear_wake_irq(&pdev->dev);
+
+	destroy_workqueue(ipcc->workqueue);
 
 	device_set_wakeup_capable(dev, false);
 

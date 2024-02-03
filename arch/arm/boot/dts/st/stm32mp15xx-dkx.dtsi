@@ -48,6 +48,18 @@
 			no-map;
 		};
 
+		mmio0: mmio0@10050000 {
+			compatible = "shared-dma-pool";
+			reg = <0x10050000 0x200>;
+			no-map;
+		};
+
+		virtio0mem: virtio0mem@10050200 {
+			compatible = "shared-dma-pool";
+			reg = <0x10050200 0x7E00>;
+			no-map;
+		};
+
 		mcuram: mcuram@30000000 {
 			compatible = "shared-dma-pool";
 			reg = <0x30000000 0x40000>;
@@ -454,6 +466,8 @@
 
 &ipcc {
 	status = "okay";
+	#interrupt-cells = <1>;
+	interrupt-controller;
 };
 
 &iwdg2 {
@@ -476,12 +490,25 @@
 
 &m4_rproc {
 	memory-region = <&retram>, <&mcuram>, <&mcuram2>, <&vdev0vring0>,
-			<&vdev0vring1>, <&vdev0buffer>;
+			<&vdev0vring1>, <&vdev0buffer>, <&mmio0>;
 	mboxes = <&ipcc 0>, <&ipcc 1>, <&ipcc 2>, <&ipcc 3>;
 	mbox-names = "vq0", "vq1", "shutdown", "detach";
 	interrupt-parent = <&exti>;
 	interrupts = <68 1>;
 	status = "okay";
+
+	ranges;
+
+	#address-cells = <1>;
+	#size-cells = <1>;
+	mmio@10050000 {
+		compatible = "virtio,mmio-remoteproc";
+		reg = <0x10050000 0x100>;
+		interrupts-extended = <&ipcc 4>;
+		memory-region = <&virtio0mem>;
+		mboxes = <&ipcc 5>;
+		mbox-names = "sync_mb";
+	};
 };
 
 &pwr_regulators {

@@ -18,6 +18,7 @@
 #include <linux/virtio_ids.h>
 #include <linux/virtio_config.h>
 #include <linux/virtio_i2c.h>
+#include <linux/dma-mapping.h>
 
 /**
  * struct virtio_i2c - virtio I2C data
@@ -39,7 +40,8 @@ struct virtio_i2c {
  * @in_hdr: the IN header of the virtio I2C message
  */
 struct virtio_i2c_req {
-	struct completion completion;
+	struct completion *completion;
+	dma_addr_t dma_handle;
 	struct virtio_i2c_out_hdr out_hdr	____cacheline_aligned;
 	uint8_t *buf				____cacheline_aligned;
 	struct virtio_i2c_in_hdr in_hdr		____cacheline_aligned;
@@ -51,7 +53,35 @@ static void virtio_i2c_msg_done(struct virtqueue *vq)
 	unsigned int len;
 
 	while ((req = virtqueue_get_buf(vq, &len)))
-		complete(&req->completion);
+		complete(req->completion);
+}
+
+static void virtio_sg_init(struct scatterlist *sg, void *cpu_addr, unsigned int len)
+{
+	if (likely(is_vmalloc_addr(cpu_addr))) {
+		sg_init_table(sg, 1);
+		sg_set_page(sg, vmalloc_to_page(cpu_addr), len,
+			    offset_in_page(cpu_addr));
+	} else {
+		WARN_ON(!virt_addr_valid(cpu_addr));
+		sg_init_one(sg, cpu_addr, len);
+	}
+}
+
+static void get_dma_buffer(struct device *dma_dev, struct virtio_i2c_req *req, struct i2c_msg *msg)
+{
+	req->buf = dma_alloc_coherent(dma_dev, msg->len, &req->dma_handle, GFP_KERNEL);
+
+	if (req->buf)
+		memcpy(req->buf, msg->buf, msg->len);
+}
+
+static void put_dma_buffer(struct device *dma_dev, struct virtio_i2c_req *req, struct i2c_msg *msg)
+{
+	if (msg->flags & I2C_M_RD)
+		memcpy(msg->buf, req->buf, msg->len);
+
+	dma_free_coherent(dma_dev, msg->len, req->buf, req->dma_handle);
 }
 
 static int virtio_i2c_prepare_reqs(struct virtqueue *vq,
@@ -64,7 +94,11 @@ static int virtio_i2c_prepare_reqs(struct virtqueue *vq,
 	for (i = 0; i < num; i++) {
 		int outcnt = 0, incnt = 0;
 
-		init_completion(&reqs[i].completion);
+		reqs[i].completion = kcalloc(1, sizeof(struct completion), GFP_KERNEL);
+		if (!reqs[i].completion)
+			break;
+
+		init_completion(reqs[i].completion);
 
 		/*
 		 * Only 7-bit mode supported for this moment. For the address
@@ -78,15 +112,18 @@ static int virtio_i2c_prepare_reqs(struct virtqueue *vq,
 		if (i != num - 1)
 			reqs[i].out_hdr.flags |= cpu_to_le32(VIRTIO_I2C_FLAGS_FAIL_NEXT);
 
-		sg_init_one(&out_hdr, &reqs[i].out_hdr, sizeof(reqs[i].out_hdr));
+		virtio_sg_init(&out_hdr, &reqs[i].out_hdr, sizeof(reqs[i].out_hdr));
 		sgs[outcnt++] = &out_hdr;
 
 		if (msgs[i].len) {
-			reqs[i].buf = i2c_get_dma_safe_msg_buf(&msgs[i], 1);
-			if (!reqs[i].buf)
-				break;
+			get_dma_buffer(vq->vdev->dev.parent, &reqs[i], &msgs[i]);
 
-			sg_init_one(&msg_buf, reqs[i].buf, msgs[i].len);
+			if (!reqs[i].buf) {
+				kfree(reqs[i].completion);
+				break;
+			}
+
+			virtio_sg_init(&msg_buf, reqs[i].buf, msgs[i].len);
 
 			if (msgs[i].flags & I2C_M_RD)
 				sgs[outcnt + incnt++] = &msg_buf;
@@ -94,11 +131,14 @@ static int virtio_i2c_prepare_reqs(struct virtqueue *vq,
 				sgs[outcnt++] = &msg_buf;
 		}
 
-		sg_init_one(&in_hdr, &reqs[i].in_hdr, sizeof(reqs[i].in_hdr));
+		virtio_sg_init(&in_hdr, &reqs[i].in_hdr, sizeof(reqs[i].in_hdr));
 		sgs[outcnt + incnt++] = &in_hdr;
 
 		if (virtqueue_add_sgs(vq, sgs, outcnt, incnt, &reqs[i], GFP_KERNEL)) {
-			i2c_put_dma_safe_msg_buf(reqs[i].buf, &msgs[i], false);
+			put_dma_buffer(vq->vdev->dev.parent, &reqs[i], &msgs[i]);
+
+			kfree(reqs[i].completion);
+
 			break;
 		}
 	}
@@ -116,12 +156,14 @@ static int virtio_i2c_complete_reqs(struct virtqueue *vq,
 	for (i = 0; i < num; i++) {
 		struct virtio_i2c_req *req = &reqs[i];
 
-		wait_for_completion(&req->completion);
+		wait_for_completion(req->completion);
 
 		if (!failed && req->in_hdr.status != VIRTIO_I2C_MSG_OK)
 			failed = true;
 
-		i2c_put_dma_safe_msg_buf(reqs[i].buf, &msgs[i], !failed);
+		put_dma_buffer(vq->vdev->dev.parent, req, &msgs[i]);
+
+		kfree(req->completion);
 
 		if (!failed)
 			j++;
@@ -137,8 +179,12 @@ static int virtio_i2c_xfer(struct i2c_adapter *adap, struct i2c_msg *msgs,
 	struct virtqueue *vq = vi->vq;
 	struct virtio_i2c_req *reqs;
 	int count;
+	dma_addr_t dma_handle;
 
-	reqs = kcalloc(num, sizeof(*reqs), GFP_KERNEL);
+	reqs = dma_alloc_coherent(vq->vdev->dev.parent,
+				  sizeof(struct virtio_i2c_req) * num,
+				  &dma_handle, GFP_KERNEL);
+
 	if (!reqs)
 		return -ENOMEM;
 
@@ -159,7 +205,9 @@ static int virtio_i2c_xfer(struct i2c_adapter *adap, struct i2c_msg *msgs,
 	count = virtio_i2c_complete_reqs(vq, reqs, msgs, count);
 
 err_free:
-	kfree(reqs);
+	dma_free_coherent(vq->vdev->dev.parent,
+			  sizeof(struct virtio_i2c_req) * num,
+			  reqs, dma_handle);
 	return count;
 }
 
